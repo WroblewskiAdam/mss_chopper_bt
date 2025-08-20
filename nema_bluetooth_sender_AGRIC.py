@@ -4,6 +4,7 @@ import threading
 import socket
 import json
 import base64
+import signal
 
 class NmeaBluetoothSender:
     # --- Konfiguracja (bez zmian) ---
@@ -39,8 +40,17 @@ class NmeaBluetoothSender:
         
         self.last_gga_for_ntrip = None
         self.last_gga_send_time = 0
+        self.last_ntrip_data = None  # Czas ostatniego otrzymania danych NTRIP
         self.data_lock = threading.Lock()
         self.stop_event = threading.Event()
+        
+        # Dodaj obsługę sygnału SIGTERM dla graceful shutdown
+        signal.signal(signal.SIGTERM, self._signal_handler)
+
+    def _signal_handler(self, signum, frame):
+        """Obsługa sygnału SIGTERM dla graceful shutdown"""
+        print(f"\nOtrzymano sygnał {signum}, zamykanie...")
+        self.stop_event.set()
 
     # --- Wszystkie funkcje connect_* pozostają BEZ ZMIAN ---
     def connect_serial(self):
@@ -52,7 +62,12 @@ class NmeaBluetoothSender:
                 return True
             except serial.SerialException as e:
                 print(f"Błąd portu szeregowego: {e}. Ponowna próba za 5s.")
-                time.sleep(5)
+                
+                # Sprawdzaj stop_event co 0.1s zamiast blokować na 5s
+                for _ in range(50):  # 50 * 0.1s = 5s
+                    if self.stop_event.is_set():
+                        return False  # Program został zatrzymany
+                    time.sleep(0.1)
         return False
 
     def connect_bluetooth(self):
@@ -68,7 +83,12 @@ class NmeaBluetoothSender:
                 print(f"Błąd połączenia Bluetooth: {e}. Ponowna próba za 1s.")
                 if self.bt_sock: self.bt_sock.close()
                 self.bt_sock = None
-                time.sleep(1)
+                
+                # Sprawdzaj stop_event co 0.1s zamiast blokować na 1s
+                for _ in range(10):  # 10 * 0.1s = 1s
+                    if self.stop_event.is_set():
+                        return False  # Program został zatrzymany
+                    time.sleep(0.1)
         return False
 
     def connect_ntrip(self):
@@ -91,13 +111,19 @@ class NmeaBluetoothSender:
             )
             self.ntrip_sock.sendall(http_request.encode('ascii'))
             response = self.ntrip_sock.recv(4096)
+            
+            # Lepsze logowanie odpowiedzi NTRIP
+            response_text = response.decode('ascii', 'ignore')
+            print(f"Odpowiedź serwera NTRIP: {response_text.strip()}")
+            
             if b"ICY 200 OK" in response:
-                print("Autoryzacja NTRIP pomyślna.")
+                print("✅ Autoryzacja NTRIP pomyślna - połączenie aktywne")
+                print(f"📤 Wysyłanie GGA do NTRIP: {self.last_gga_for_ntrip.strip()}")
                 self.ntrip_sock.sendall(self.last_gga_for_ntrip.encode('ascii'))
                 self.last_gga_send_time = time.time()
                 return True
             else:
-                print(f"Błąd autoryzacji NTRIP. Odpowiedź: {response.decode('ascii', 'ignore')}")
+                print(f"❌ Błąd autoryzacji NTRIP. Kod odpowiedzi: {response_text.split()[0] if response_text.split() else 'Nieznany'}")
                 self.ntrip_sock.close(); self.ntrip_sock = None
                 return False
         except socket.error as e:
@@ -158,10 +184,11 @@ class NmeaBluetoothSender:
                         self.connect_ntrip()
                     elif time.time() - self.last_gga_send_time > self.NTRIP_GGA_INTERVAL:
                         try:
+                            print(f"📤 Wysyłanie GGA do NTRIP (co {self.NTRIP_GGA_INTERVAL}s): {self.last_gga_for_ntrip.strip()}")
                             self.ntrip_sock.sendall(self.last_gga_for_ntrip.encode('ascii'))
                             self.last_gga_send_time = time.time()
                         except socket.error as e:
-                            print(f"\nBłąd wysyłania GGA do NTRIP: {e}.")
+                            print(f"\n❌ Błąd wysyłania GGA do NTRIP: {e}.")
                             if self.ntrip_sock: self.ntrip_sock.close(); self.ntrip_sock = None
             except serial.SerialException as e:
                 print(f"\nBłąd odczytu z portu szeregowego: {e}")
@@ -179,10 +206,14 @@ class NmeaBluetoothSender:
             try:
                 data = self.ntrip_sock.recv(4096)
                 if data:
+                    # Lepsze logowanie danych NTRIP
+                    print(f"\n📡 Otrzymano {len(data)} bajtów RTCM z NTRIP")
                     if self.ser and self.ser.is_open:
                         self.ser.write(data)
+                        # Aktualizuj czas ostatniego otrzymania danych
+                        self.last_ntrip_data = time.time()
                 else:
-                    print("\nPołączenie NTRIP zamknięte przez serwer.")
+                    print("\n⚠️ Połączenie NTRIP zamknięte przez serwer.")
                     if self.ntrip_sock: self.ntrip_sock.close()
                     self.ntrip_sock = None
             except socket.timeout:
@@ -234,7 +265,18 @@ class NmeaBluetoothSender:
                 bt_status = "OK" if self.bt_sock and self.bt_sock.fileno() != -1 else "Brak"
                 ntrip_status = "OK" if self.ntrip_sock and self.ntrip_sock.fileno() != -1 else "Brak"
                 
-                print(f"Lat: {lat:.6f}, Lon: {lon:.6f} | RTK: {status_map.get(status, f'Inny({status})')} | V: {speed:.4f} m/s | H: {heading:.4f}° | R: {roll:.4f}° | BT: {bt_status} | NTRIP: {ntrip_status}      ", end='\r')
+                # Dodaj informację o ostatnich danych NTRIP
+                ntrip_info = ""
+                if self.last_ntrip_data:
+                    time_since_last = time.time() - self.last_ntrip_data
+                    if time_since_last < 60:  # Mniej niż 1 minuta
+                        ntrip_info = f" | NTRIP: {ntrip_status} (ostatnio: {time_since_last:.1f}s)"
+                    else:
+                        ntrip_info = f" | NTRIP: {ntrip_status} (ostatnio: {time_since_last/60:.1f}min)"
+                else:
+                    ntrip_info = f" | NTRIP: {ntrip_status} (brak danych)"
+                
+                print(f"Lat: {lat:.6f}, Lon: {lon:.6f} | RTK: {status_map.get(status, f'Inny({status})')} | V: {speed:.4f} m/s | H: {heading:.4f}° | R: {roll:.4f}° | BT: {bt_status}{ntrip_info}      ", end='\r')
                 time.sleep(0.5)
         except KeyboardInterrupt:
             print("\nZamykanie...")
